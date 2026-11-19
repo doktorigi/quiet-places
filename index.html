@@ -1,0 +1,276 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Quiet Places</title>
+<link rel="icon" href="data:,">
+<meta name="description" content="A free, open-source meditation inside real 360° photos, for Meta Quest and any browser.">
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #10131f; color: #fff;
+    font: 18px/1.5 system-ui, sans-serif; }
+  canvas { display: block; touch-action: none; }
+  [hidden] { display: none !important; }
+  #ui { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center;
+    justify-content: center; gap: .9rem; text-align: center; padding: 16px; overflow: auto;
+    background: rgba(16, 19, 31, .62); }
+  h1 { font-weight: 300; font-size: 2.4rem; margin: 0; letter-spacing: .08em; }
+  p { margin: 0; max-width: 36rem; opacity: .9; }
+  button { font: inherit; color: #fff; background: rgba(255, 255, 255, .12);
+    border: 1px solid rgba(255, 255, 255, .6); border-radius: 999px; padding: .8rem 1.8rem; cursor: pointer; }
+  button:hover, button:focus-visible { background: rgba(255, 255, 255, .3); }
+  .row { display: flex; gap: .8rem; flex-wrap: wrap; justify-content: center; }
+  #places button { border-radius: 14px; padding: 6px 6px 4px; font-size: .85rem; border-width: 2px;
+    border-color: transparent; background: rgba(255, 255, 255, .08); }
+  #places button[aria-pressed="true"] { border-color: #ffd9a0; background: rgba(255, 217, 160, .18); }
+  #places img { display: block; width: 168px; height: 94px; object-fit: cover; border-radius: 9px; margin-bottom: 2px; }
+  #end { position: fixed; bottom: 16px; right: 16px; background: rgba(16, 19, 31, .62); }
+  a { color: #ffd9a0; }
+</style>
+</head>
+<body>
+<div id="ui">
+  <h1>Quiet Places</h1>
+  <p>Sit inside a real place. Choose where, then how long.</p>
+  <div id="places" class="row" role="group" aria-label="Place"></div>
+  <div id="lengths" class="row">
+    <button data-min="5">5 minutes</button>
+    <button data-min="10">10 minutes</button>
+    <button data-min="20">20 minutes</button>
+  </div>
+  <p><small>In a headset this opens in VR: pull the trigger or pinch to move to the next place. On a screen, drag to look around.
+    Photos are public domain (CC0) from <a href="https://polyhaven.com/hdris">Poly Haven</a>. Free and open source:
+    <a href="https://github.com/doktorigi/quiet-places">source</a>.</small></p>
+</div>
+<button id="end" hidden>End session</button>
+
+<script type="module">
+import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js';
+
+// Each place: photo id, menu name, yaw (degrees, turns the best view to face you) and its sound mix (0..1 each).
+// Sound and facing can only be judged in the headset: these are the knobs.
+const PLACES = [
+  { id: 'table_mountain_1', name: 'Mountain top', yaw: 0, wind: 0.55, waves: 0, stream: 0 },
+  { id: 'lakeside_sunrise', name: 'Lake at sunrise', yaw: 0, wind: 0.2, waves: 0.35, stream: 0 },
+  { id: 'misty_pines', name: 'Misty pines', yaw: 0, wind: 0.35, waves: 0, stream: 0 },
+  { id: 'secluded_beach', name: 'Secluded beach', yaw: 0, wind: 0.2, waves: 0.7, stream: 0 },
+  { id: 'lauter_waterfall', name: 'Forest stream', yaw: 0, wind: 0.12, waves: 0, stream: 0.5 },
+  { id: 'rogland_clear_night', name: 'Milky Way', yaw: 0, wind: 0.22, waves: 0, stream: 0 },
+];
+const DRONE_LEVEL = 0.07;
+
+// ponytail: one fixed pace (4s in, 2s hold, 6s out). Add a pace picker if people ask.
+const PHASES = [['in', 4], ['hold', 2], ['out', 6]];
+const CYCLE = PHASES.reduce((s, p) => s + p[1], 0);
+const ease = x => 0.5 - 0.5 * Math.cos(Math.PI * x);
+
+// Seconds since session start -> how full the lungs are (0 = empty, 1 = full).
+function breath(t) {
+  let u = ((t % CYCLE) + CYCLE) % CYCLE;
+  for (const [phase, len] of PHASES) {
+    if (u < len) return phase === 'in' ? ease(u / len) : phase === 'hold' ? 1 : 1 - ease(u / len);
+    u -= len;
+  }
+}
+
+if (location.hash === '#test') {
+  const eq = (a, b) => { if (Math.abs(a - b) > 1e-9) throw new Error(`check: ${a} != ${b}`); };
+  eq(breath(0), 0); eq(breath(2), 0.5); eq(breath(5), 1); eq(breath(9), 0.5); eq(breath(CYCLE + 2), 0.5);
+  document.title = 'tests ok';
+}
+
+// ---------- the photo sphere ----------
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.xr.enabled = true;
+document.body.prepend(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.1, 200);
+camera.rotation.order = 'YXZ';
+camera.position.set(0, 1.5, 0);
+let yaw = 0, pitch = 0;
+
+const sphere = new THREE.Mesh(new THREE.SphereGeometry(50, 96, 48).scale(-1, 1, 1), new THREE.MeshBasicMaterial());
+scene.add(sphere);
+
+// 8K where the device can take it, else 4K. Override with ?res=4k or ?res=8k.
+const RES = new URLSearchParams(location.search).get('res') || (renderer.capabilities.maxTextureSize >= 8192 ? '8k' : '4k');
+const previews = PLACES.map(p => {
+  const t = new THREE.TextureLoader().load(`photos/${p.id}_preview.jpg`);
+  t.colorSpace = THREE.SRGBColorSpace;
+  return t;
+});
+const bitmapLoader = new THREE.ImageBitmapLoader().setOptions({ imageOrientation: 'flipY' });
+let current = 0, loadToken = 0, hires = null;
+
+function setTexture(t) {
+  sphere.material.map = t;
+  sphere.material.needsUpdate = true;
+}
+// Show a place: its small preview at once, then the full photo when it has loaded and decoded.
+function show(i) {
+  current = (i + PLACES.length) % PLACES.length;
+  const place = PLACES[current], token = ++loadToken;
+  setTexture(previews[current]);
+  sphere.rotation.y = THREE.MathUtils.degToRad(place.yaw);
+  [...placesEl.children].forEach((b, k) => b.setAttribute('aria-pressed', k === current));
+  mixSound();
+  bitmapLoader.load(`photos/${place.id}_${RES}.jpg`, bitmap => {
+    if (token !== loadToken) return bitmap.close(); // the user has already moved on
+    hires?.image.close(); hires?.dispose();          // one full photo in memory at a time
+    hires = new THREE.CanvasTexture(bitmap);
+    hires.colorSpace = THREE.SRGBColorSpace;
+    hires.generateMipmaps = false; hires.minFilter = THREE.LinearFilter; // shown about 1:1, mips would only cost memory
+    setTexture(hires);
+  }, undefined, e => console.warn('full photo failed to load, staying on the preview', e));
+}
+
+// ---------- sound (all synthesised from one noise buffer, no audio files) ----------
+let ctx, sound;
+function startAudio() {
+  ctx ??= new AudioContext();
+  ctx.resume();
+  const now = ctx.currentTime, out = ctx.createGain();
+  out.gain.setValueAtTime(0, now);
+  out.gain.linearRampToValueAtTime(1, now + 4);
+  out.connect(ctx.destination);
+
+  const buf = ctx.createBuffer(1, ctx.sampleRate * 3, ctx.sampleRate), data = buf.getChannelData(0);
+  for (let i = 0; i < data.length; i++) data[i] = Math.random() * 2 - 1;
+  const src = ctx.createBufferSource();
+  src.buffer = buf; src.loop = true;
+  const sources = [src];
+  // One noise layer: filter, level, and an optional slow swell (LFO) on the level.
+  const layer = (type, freq, q, lfoHz) => {
+    const f = ctx.createBiquadFilter(), g = ctx.createGain(), swell = ctx.createGain();
+    f.type = type; f.frequency.value = freq; f.Q.value = q; g.gain.value = 0; swell.gain.value = 0;
+    src.connect(f).connect(g).connect(out);
+    const lfo = ctx.createOscillator();
+    lfo.frequency.value = lfoHz;
+    lfo.connect(swell).connect(g.gain);
+    sources.push(lfo);
+    return { f, g, swell };
+  };
+  const wind = layer('bandpass', 300, 0.5, 0.06);
+  const waves = layer('lowpass', 500, 0.3, 0.11);   // slow surge and retreat
+  const stream = layer('bandpass', 1800, 0.7, 0.9); // steady babble with a little flutter
+
+  const lp = ctx.createBiquadFilter(), droneGain = ctx.createGain();
+  lp.frequency.value = 250; droneGain.gain.value = DRONE_LEVEL;
+  lp.connect(droneGain).connect(out);
+  for (const f of [110, 110.6, 165, 220.4]) {
+    const o = ctx.createOscillator(), g = ctx.createGain();
+    o.type = 'sawtooth'; o.frequency.value = f; g.gain.value = 0.25;
+    o.connect(g).connect(lp);
+    sources.push(o);
+  }
+  sources.forEach(s => s.start());
+  sound = { out, lp, wind, waves, stream, sources };
+  mixSound();
+}
+// Cross-fade the layers to the current place's mix.
+function mixSound() {
+  if (!sound) return;
+  const p = PLACES[current], now = ctx.currentTime;
+  const set = (layer, level, steady, swell) => {
+    layer.g.gain.setTargetAtTime(level * steady, now, 1.5);
+    layer.swell.gain.setTargetAtTime(level * swell, now, 1.5);
+  };
+  set(sound.wind, p.wind, 0.7, 0.3);
+  set(sound.waves, p.waves, 0.55, 0.45);
+  set(sound.stream, p.stream * 0.5, 0.9, 0.1);
+}
+function stopAudio() {
+  if (!sound) return;
+  const { out, sources } = sound, now = ctx.currentTime;
+  sound = null;
+  out.gain.cancelScheduledValues(now);
+  out.gain.setValueAtTime(out.gain.value, now);
+  out.gain.linearRampToValueAtTime(0, now + 3);
+  sources.forEach(s => s.stop(now + 3));
+}
+function bell() {
+  const now = ctx.currentTime;
+  for (const [f, vol] of [[528, 0.3], [1056, 0.08], [1584, 0.04]]) {
+    const o = ctx.createOscillator(), g = ctx.createGain();
+    o.frequency.value = f;
+    g.gain.setValueAtTime(vol, now);
+    g.gain.exponentialRampToValueAtTime(0.0001, now + 5);
+    o.connect(g).connect(ctx.destination);
+    o.start(now); o.stop(now + 5);
+  }
+}
+
+// ---------- menu and session ----------
+const ui = document.getElementById('ui'), endBtn = document.getElementById('end'), placesEl = document.getElementById('places');
+PLACES.forEach((p, i) => {
+  const b = document.createElement('button'), img = document.createElement('img');
+  img.src = `photos/${p.id}_preview.jpg`; img.alt = '';
+  b.append(img, p.name);
+  b.addEventListener('click', () => show(i));
+  placesEl.append(b);
+});
+show(0);
+
+let running = false, t0 = 0, duration = 0, xrSession = null, vrOK = false;
+navigator.xr?.isSessionSupported('immersive-vr').then(ok => { vrOK = ok; }).catch(() => {});
+
+async function start(minutes) {
+  startAudio(); bell();
+  duration = minutes * 60; t0 = performance.now(); running = true;
+  ui.hidden = true; endBtn.hidden = false;
+  if (!vrOK) return;
+  try {
+    xrSession = await navigator.xr.requestSession('immersive-vr', { optionalFeatures: ['local-floor'] });
+    xrSession.addEventListener('end', () => { xrSession = null; stop(); });
+    xrSession.addEventListener('select', () => show(current + 1)); // trigger or pinch: next place
+    await renderer.xr.setSession(xrSession);
+    t0 = performance.now(); // the permission prompt shouldn't eat session time
+  } catch (e) {
+    console.warn('VR unavailable, playing on screen instead', e);
+    xrSession?.end().catch(() => {});
+  }
+}
+function stop() {
+  if (!running) return;
+  running = false;
+  bell(); stopAudio();
+  ui.hidden = false; endBtn.hidden = true;
+  xrSession?.end().catch(() => {});
+}
+document.getElementById('lengths').addEventListener('click', e => {
+  const min = Number(e.target.dataset?.min);
+  if (min) start(min);
+});
+endBtn.addEventListener('click', stop);
+
+// On a flat screen, drag to look around (the headset does this by itself).
+renderer.domElement.addEventListener('pointermove', e => {
+  if (!e.buttons || renderer.xr.isPresenting) return;
+  yaw += e.movementX * 0.003;
+  pitch = Math.min(1.4, Math.max(-1.4, pitch + e.movementY * 0.003));
+  camera.rotation.set(pitch, yaw, 0);
+});
+addEventListener('resize', () => {
+  if (renderer.xr.isPresenting) return;
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+renderer.setAnimationLoop(() => {
+  const now = performance.now(), t = (running ? now - t0 : now) / 1000, b = breath(t);
+  sphere.position.copy(camera.position); // keep the photo centred on your head so it stays at infinity
+  // Wind and drone open up on the in-breath: the breathing cue here is sound only.
+  if (sound) {
+    sound.wind.f.frequency.setTargetAtTime(260 + 240 * b, ctx.currentTime, 0.2);
+    sound.lp.frequency.setTargetAtTime(250 + 450 * b, ctx.currentTime, 0.1);
+  }
+  if (running && t >= duration) stop();
+  renderer.render(scene, camera);
+});
+</script>
+</body>
+</html>
